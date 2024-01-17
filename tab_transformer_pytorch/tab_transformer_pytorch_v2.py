@@ -241,7 +241,7 @@ class TabTransformer(nn.Module):
         )
 
         self.transformer_text = Transformer(
-            dim = vocabulary_dim,
+            dim = dim,
             depth = depth,
             heads = heads,
             dim_head = dim_head,
