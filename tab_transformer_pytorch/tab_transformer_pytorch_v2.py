@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, einsum
 
+import math
 from einops import rearrange, repeat
 
 # helpers
@@ -140,6 +141,14 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.mlp(x)
 
+def positional_encoding(L, embedding_dim):
+    pos_enc = torch.zeros((L, embedding_dim))
+    for pos in range(L):
+        for i in range(0, embedding_dim, 2):
+            pos_enc[pos, i] = math.sin(pos / (10000 ** ((2 * i)/embedding_dim)))
+            pos_enc[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1))/embedding_dim)))
+    return pos_enc
+
 # main class
 
 class TabTransformer(nn.Module):
@@ -147,7 +156,10 @@ class TabTransformer(nn.Module):
         self,
         *,
         categories,
+        max_text_length,
         num_continuous,
+        vocabulary_size,
+        vocabulary_dim,
         dim,
         depth,
         heads,
@@ -164,12 +176,14 @@ class TabTransformer(nn.Module):
     ):
         super().__init__()
         assert all(map(lambda n: n > 0, categories)), 'number of each category must be positive'
-        assert len(categories) + num_continuous > 0, 'input shape must not be null'
+        assert len(categories) + num_continuous > 0 + max_text_length, 'input shape must not be null'
 
         # categories related calculations
 
         self.num_categories = len(categories)
         self.num_unique_categories = sum(categories)
+
+        self.max_text_length = max_text_length  # This is concatenation of all the text columns, but each truncated
 
         # create category embeddings table
 
@@ -195,6 +209,15 @@ class TabTransformer(nn.Module):
             categories_offset = categories_offset.cumsum(dim = -1)[:-1]
             self.register_buffer('categories_offset', categories_offset)
 
+        # textual
+        self.vocabulary_dim = vocabulary_dim
+        self.text_embed = nn.Embedding(vocabulary_size, vocabulary_dim)
+        if vocabulary_dim != dim:
+            self.text_embed_reduce = nn.Linear(vocabulary_dim, dim)
+        else:
+            self.text_embed_reduce = nn.Identity()
+        self.pos_encoding = positional_encoding(self.max_text_length, self.vocabulary_dim).unsqueeze(0)
+
         # continuous
 
         self.num_continuous = num_continuous
@@ -208,8 +231,17 @@ class TabTransformer(nn.Module):
 
         # transformer
 
-        self.transformer = Transformer(
+        self.transformer_categ = Transformer(
             dim = dim,
+            depth = depth,
+            heads = heads,
+            dim_head = dim_head,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout
+        )
+
+        self.transformer_text = Transformer(
+            dim = vocabulary_dim,
             depth = depth,
             heads = heads,
             dim_head = dim_head,
@@ -219,14 +251,14 @@ class TabTransformer(nn.Module):
 
         # mlp to logits
 
-        input_size = (dim * self.num_categories) + num_continuous
+        input_size = (dim * self.num_categories) + num_continuous + (vocabulary_dim * max_text_length)
 
         hidden_dimensions = [input_size * t for t in  mlp_hidden_mults]
         all_dimensions = [input_size, *hidden_dimensions, dim_out]
 
         self.mlp = MLP(all_dimensions, act = mlp_act)
 
-    def forward(self, x_categ, x_cont, return_attn = False):
+    def forward(self, x_categ, x_cont, x_text, return_attn = False):
         xs = []
 
         assert x_categ.shape[-1] == self.num_categories, f'you must pass in {self.num_categories} values for your categories input'
@@ -240,10 +272,21 @@ class TabTransformer(nn.Module):
                 shared_categ_embed = repeat(self.shared_category_embed, 'n d -> b n d', b = categ_embed.shape[0])
                 categ_embed = torch.cat((categ_embed, shared_categ_embed), dim = -1)
 
-            x, attns = self.transformer(categ_embed, return_attn = True)
+            x, attns_categ = self.transformer_categ(categ_embed, return_attn = True)
 
-            flat_categ = rearrange(x, 'b ... -> b (...)')
-            xs.append(flat_categ)
+        flat_x = rearrange(x, 'b ... -> b (...)')
+        xs.append(flat_x)
+
+        assert x_text.shape[-1] == self.max_text_length, f'you must pass in {self.max_text_length} of tokens for your text input'
+
+        if self.max_text_length > 0:
+            x_text = self.text_embed(x_text) + self.pos_encoding
+            x_text = self.text_embed_reduce(x_text)
+
+            x, attns_text = self.transformer_text(categ_embed, return_attn = True)
+
+            flat_text = rearrange(x, 'b ... -> b (...)')
+            xs.append(flat_text)
 
         assert x_cont.shape[1] == self.num_continuous, f'you must pass in {self.num_continuous} values for your continuous input'
 
@@ -261,4 +304,4 @@ class TabTransformer(nn.Module):
         if not return_attn:
             return logits
 
-        return logits, attns
+        return logits, attns_categ, attns_text
